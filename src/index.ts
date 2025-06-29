@@ -125,23 +125,46 @@ async function makeRequest(endpoint: string, data: any, method: string = "POST")
     method,
     headers,
     body: JSON.stringify(data),
-    signal: controller.signal // <-- Ajout du signal d'abandon
+    signal: controller.signal
   };
 
   log(`Making ${method} request to ${endpoint} with data: ${JSON.stringify(data)}`);
   const startTime = Date.now();
   try {
     const response = await fetch(url, options);
-    clearTimeout(timeoutId); // Important: annuler le timeout si la requête réussit
+    clearTimeout(timeoutId);
+    
+    const responseText = await response.text();
+
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      throw new Error(`API error: ${response.status} ${errorData.message || response.statusText}`);
+      let errorInfo = response.statusText;
+      try {
+        const errorData = JSON.parse(responseText);
+        if (errorData.message) {
+          errorInfo = errorData.message;
+        }
+      } catch (e) {
+        // Not a JSON error, stick with statusText
+      }
+      throw new Error(`API error: ${response.status} ${errorInfo}`);
     }
-    const result = await response.json();
-    log(`API request to ${endpoint} completed in ${Date.now() - startTime}ms`);
-    return result;
+
+    if (!responseText.trim()) {
+        log(`API request to ${endpoint} completed in ${Date.now() - startTime}ms with empty body.`);
+        return null;
+    }
+    
+    try {
+        const result = JSON.parse(responseText);
+        log(`API request to ${endpoint} completed in ${Date.now() - startTime}ms`);
+        return result;
+    } catch(e) {
+        log(`Error parsing JSON from API response for ${endpoint}. Body: ${responseText}`);
+        throw new Error(`Failed to parse API response for ${endpoint}.`);
+    }
+
   } catch (error: any) {
-    clearTimeout(timeoutId); // Important: annuler aussi en cas d'erreur
+    clearTimeout(timeoutId);
     if (error.name === 'AbortError') {
       const message = 'The request to the Horizon Data Wave API timed out after 30 seconds.';
       log(message);
@@ -712,7 +735,7 @@ export async function callLinkedinTool(name: string, args: any) {
         const { user, with_experience = true, with_education = true, with_skills = true } = args as LinkedinUserProfileArgs;
         const requestData = { timeout: 300, user, with_experience, with_education, with_skills };
         log("Starting LinkedIn profile lookup for:", user);
-        const response = await makeRequest(API_CONFIG.ENDPOINTS.USER_PROFILE, requestData);
+        const response = await getLinkedinUserProfile(args);
         return response;
       }
 
@@ -1108,4 +1131,28 @@ export async function callLinkedinTool(name: string, args: any) {
     log("Tool error:", error);
     throw error;
   }
+}
+
+async function getLinkedinUserProfile(args: LinkedinUserProfileArgs) {
+  log(`Getting LinkedIn profile for: ${args.user}`);
+  
+  const requestData = {
+    user: args.user,
+    with_experience: true,
+    with_education: true,
+    with_skills: true,
+    with_certificates: true,
+    with_languages: true,
+    with_honors: true,
+    with_patents: true,
+  };
+
+  const profileData = await makeRequest(API_CONFIG.ENDPOINTS.USER_PROFILE, requestData);
+  
+  log(`Profile data for ${args.user} fully assembled.`);
+  return profileData;
+}
+
+async function getLinkedinEmailUser(args: LinkedinEmailUserArgs) {
+  // ... existing code ...
 }
