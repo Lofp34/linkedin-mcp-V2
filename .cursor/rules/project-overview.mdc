@@ -1,0 +1,24 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Project Structure Guide
+
+This project is a Model Context Protocol (MCP) server that provides access to Horizon Data Wave's LinkedIn API.
+
+## Key Files
+
+*   **`package.json`**: ([package.json](mdc:package.json)) Defines project metadata, dependencies (`@modelcontextprotocol/sdk`, `dotenv`), and scripts.
+*   **`src/index.ts`**: ([src/index.ts](mdc:src/index.ts)) The main entry point of the application. It initializes the MCP server, defines the tools corresponding to the LinkedIn API endpoints, and handles tool calls.
+*   **`src/types.ts`**: ([src/types.ts](mdc:src/types.ts)) Contains TypeScript interfaces for tool arguments and custom type guard functions for runtime validation.
+*   **`Dockerfile`**: ([Dockerfile](mdc:Dockerfile)) A multi-stage Dockerfile for building an optimized production container image.
+*   **`tsconfig.json`**: ([tsconfig.json](mdc:tsconfig.json)) TypeScript compiler configuration. It compiles `src` files into the `build` directory.
+
+## Workflow
+
+1.  The server is started by running `node build/index.js`.
+2.  It communicates over stdio, listening for MCP requests.
+3.  When a `callTool` request is received, it validates the input using the functions in `src/types.ts`.
+4.  It then makes an authenticated API call to the Horizon Data Wave API using the `makeRequest` function.
+5.  The result from the API is formatted and sent back as an MCP response.

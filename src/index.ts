@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
@@ -116,18 +114,25 @@ function log(message: string, ...args: any[]) {
 async function makeRequest(endpoint: string, data: any, method: string = "POST"): Promise<any> {
   const baseUrl = API_CONFIG.BASE_URL.replace(/\/+$/, "");
   const url = baseUrl + (endpoint.startsWith("/") ? endpoint : `/${endpoint}`);
+  
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30-second timeout
+
   const headers = new Headers();
   headers.append("Content-Type", "application/json");
   headers.append("access-token", API_KEY!);
   const options: RequestInit = {
     method,
     headers,
-    body: JSON.stringify(data)
+    body: JSON.stringify(data),
+    signal: controller.signal // <-- Ajout du signal d'abandon
   };
+
   log(`Making ${method} request to ${endpoint} with data: ${JSON.stringify(data)}`);
   const startTime = Date.now();
   try {
     const response = await fetch(url, options);
+    clearTimeout(timeoutId); // Important: annuler le timeout si la requête réussit
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
       throw new Error(`API error: ${response.status} ${errorData.message || response.statusText}`);
@@ -135,7 +140,13 @@ async function makeRequest(endpoint: string, data: any, method: string = "POST")
     const result = await response.json();
     log(`API request to ${endpoint} completed in ${Date.now() - startTime}ms`);
     return result;
-  } catch (error) {
+  } catch (error: any) {
+    clearTimeout(timeoutId); // Important: annuler aussi en cas d'erreur
+    if (error.name === 'AbortError') {
+      const message = 'The request to the Horizon Data Wave API timed out after 30 seconds.';
+      log(message);
+      throw new Error(message);
+    }
     log(`API request to ${endpoint} failed after ${Date.now() - startTime}ms:`, error);
     throw error;
   }
@@ -603,74 +614,53 @@ const GOOGLE_SEARCH_TOOL: Tool = {
   }
 };
 
-const server = new Server(
-  { name: "hdw-mcp", version: "0.1.0" },
-  {
-    capabilities: {
-      resources: { supportedTypes: ["application/json", "text/plain"] },
-      tools: { linkedin: { description: "LinkedIn data access functionality" } }
-    }
-  }
-);
+const ALL_TOOLS = [
+  SEARCH_LINKEDIN_USERS_TOOL,
+  GET_LINKEDIN_PROFILE_TOOL,
+  GET_LINKEDIN_EMAIL_TOOL,
+  GET_LINKEDIN_USER_POSTS_TOOL,
+  GET_LINKEDIN_USER_REACTIONS_TOOL,
+  GET_CHAT_MESSAGES_TOOL,
+  SEND_CHAT_MESSAGE_TOOL,
+  SEND_CONNECTION_REQUEST_TOOL,
+  POST_COMMENT_TOOL,
+  GET_USER_CONNECTIONS_TOOL,
+  GET_LINKEDIN_POST_REPOSTS_TOOL,
+  GET_LINKEDIN_POST_COMMENTS_TOOL,
+  GET_LINKEDIN_GOOGLE_COMPANY_TOOL,
+  GET_LINKEDIN_COMPANY_TOOL,
+  GET_LINKEDIN_COMPANY_EMPLOYEES_TOOL,
+  SEND_LINKEDIN_POST_TOOL,
+  LINKEDIN_SN_SEARCH_USERS_TOOL,
+  GET_LINKEDIN_CONVERSATIONS_TOOL,
+  GOOGLE_SEARCH_TOOL
+];
 
-server.onerror = (error) => {
-  log("MCP Server Error:", error);
-};
-
-server.onclose = () => {
-  log("MCP Server Connection Closed");
-};
-
-server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-  resources: [
-    {
-      uri: `linkedin://users/${encodeURIComponent(API_CONFIG.DEFAULT_QUERY)}`,
-      name: `LinkedIn users for "${API_CONFIG.DEFAULT_QUERY}"`,
-      mimeType: "application/json",
-      description: "LinkedIn user search results including name, headline, and location"
-    }
-  ]
-}));
-
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    SEARCH_LINKEDIN_USERS_TOOL,
-    GET_LINKEDIN_PROFILE_TOOL,
-    GET_LINKEDIN_EMAIL_TOOL,
-    GET_LINKEDIN_USER_POSTS_TOOL,
-    GET_LINKEDIN_USER_REACTIONS_TOOL,
-    GET_CHAT_MESSAGES_TOOL,
-    SEND_CHAT_MESSAGE_TOOL,
-    SEND_CONNECTION_REQUEST_TOOL,
-    POST_COMMENT_TOOL,
-    GET_USER_CONNECTIONS_TOOL,
-    GET_LINKEDIN_POST_REPOSTS_TOOL,
-    GET_LINKEDIN_POST_COMMENTS_TOOL,
-    GET_LINKEDIN_GOOGLE_COMPANY_TOOL,
-    GET_LINKEDIN_COMPANY_TOOL,
-    GET_LINKEDIN_COMPANY_EMPLOYEES_TOOL,
-    SEND_LINKEDIN_POST_TOOL,
-    LINKEDIN_SN_SEARCH_USERS_TOOL,
-    GET_LINKEDIN_CONVERSATIONS_TOOL,
-    GOOGLE_SEARCH_TOOL
-  ]
-}));
-
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+// EXPORT a function that encapsulates the tool logic
+export async function callLinkedinTool(name: string, args: any) {
   try {
-    const { name, arguments: args } = request.params;
-    if (!args) throw new Error("No arguments provided");
-
     switch (name) {
       case "search_linkedin_users": {
         if (!isValidLinkedinSearchUsersArgs(args)) {
-          throw new McpError(ErrorCode.InvalidParams, "Invalid LinkedIn search arguments");
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "Invalid search arguments"
+          );
         }
         const {
-          keywords, first_name, last_name, title, company_keywords,
-          school_keywords, current_company, past_company, location,
-          industry, education, count = 10, timeout = 300
+          keywords,
+          first_name,
+          last_name,
+          title,
+          company_keywords,
+          school_keywords,
+          current_company,
+          past_company,
+          location,
+          industry,
+          education,
+          count = 10,
+          timeout = 300
         } = args as LinkedinSearchUsersArgs;
         const requestData: any = { timeout, count };
         if (keywords) requestData.keywords = keywords;
@@ -710,31 +700,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               : education;
         }
         log("Starting LinkedIn users search with:", JSON.stringify(requestData));
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.SEARCH_USERS, requestData);
-          log(`Search complete, found ${response.length} results`);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn search error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn search API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.SEARCH_USERS, requestData);
+        log(`Search complete, found ${response.length} results`);
+        return response;
       }
 
       case "get_linkedin_profile": {
@@ -744,30 +712,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { user, with_experience = true, with_education = true, with_skills = true } = args as LinkedinUserProfileArgs;
         const requestData = { timeout: 300, user, with_experience, with_education, with_skills };
         log("Starting LinkedIn profile lookup for:", user);
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.USER_PROFILE, requestData);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn profile lookup error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.USER_PROFILE, requestData);
+        return response;
       }
 
       case "get_linkedin_email_user": {
@@ -777,30 +723,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { email, count = 5, timeout = 300 } = args as LinkedinEmailUserArgs;
         const requestData = { timeout, email, count };
         log("Starting LinkedIn email lookup for:", email);
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_EMAIL, requestData);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn email lookup error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn email API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_EMAIL, requestData);
+        return response;
       }
 
       case "get_linkedin_user_posts": {
@@ -814,30 +738,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         log("Starting LinkedIn user posts lookup for urn:", normalizedURN);
         const requestData = { timeout, urn: normalizedURN, count };
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_USER_POSTS, requestData);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn user posts lookup error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn user posts API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_USER_POSTS, requestData);
+        return response;
       }
 
       case "get_linkedin_user_reactions": {
@@ -851,30 +753,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         log("Starting LinkedIn user reactions lookup for urn:", normalizedURN);
         const requestData = { timeout, urn: normalizedURN, count };
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_USER_REACTIONS, requestData);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn user reactions lookup error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn user reactions API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_USER_REACTIONS, requestData);
+        return response;
       }
 
       case "get_linkedin_chat_messages": {
@@ -889,31 +769,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const requestData: any = { timeout, user: normalizedUser, count, account_id: ACCOUNT_ID };
         if (company) requestData.company = company;
         log("Starting LinkedIn chat messages lookup for user:", normalizedUser);
-        try {
-          // Changed from GET to using default POST
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.CHAT_MESSAGES, requestData);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn chat messages lookup error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn chat messages API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.CHAT_MESSAGES, requestData);
+        return response;
       }
 
       case "send_linkedin_chat_message": {
@@ -928,30 +785,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const requestData: any = { timeout, user: normalizedUser, text, account_id: ACCOUNT_ID };
         if (company) requestData.company = company;
         log("Starting LinkedIn send chat message for user:", normalizedUser);
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.CHAT_MESSAGE, requestData, "POST");
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn send chat message error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn send chat message API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.CHAT_MESSAGE, requestData, "POST");
+        return response;
       }
 
       case "send_linkedin_connection": {
@@ -965,30 +800,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         const requestData = { timeout, user: normalizedUser, account_id: ACCOUNT_ID };
         log("Sending LinkedIn connection request to user:", normalizedUser);
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.USER_CONNECTION, requestData, "POST");
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn connection request error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn connection request API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.USER_CONNECTION, requestData, "POST");
+        return response;
       }
 
       case "send_linkedin_post_comment": {
@@ -1015,30 +828,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           account_id: ACCOUNT_ID
         };
         log(`Creating LinkedIn comment on ${urn}`);
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.POST_COMMENT, requestData, "POST");
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn comment creation error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn comment API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.POST_COMMENT, requestData, "POST");
+        return response;
       }
 
       case "send_linkedin_post": {
@@ -1061,30 +852,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         log("Creating LinkedIn post with text:", text.substring(0, 50) + (text.length > 50 ? "..." : ""));
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_POST, requestData, "POST");
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn post creation error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn post creation API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_POST, requestData, "POST");
+        return response;
       }
 
       case "get_linkedin_user_connections": {
@@ -1108,31 +877,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           requestData.count = Number(count);
         }
         log("Starting LinkedIn user connections lookup");
-        try {
-          // Changed from GET to using default POST
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.USER_CONNECTIONS, requestData);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn user connections lookup error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn user connections API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.USER_CONNECTIONS, requestData);
+        return response;
       }
 
       case "get_linkedin_post_reposts": {
@@ -1146,30 +892,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           count: Number(count)
         };
         log(`Starting LinkedIn post reposts lookup for: ${urn}`);
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_POST_REPOSTS, requestData);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn post reposts lookup error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn post reposts API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_POST_REPOSTS, requestData);
+        return response;
       }
 
       case "get_linkedin_post_comments": {
@@ -1184,30 +908,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           count: Number(count)
         };
         log(`Starting LinkedIn post comments lookup for: ${urn}`);
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_POST_COMMENTS, requestData);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn post comments lookup error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn post comments API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_POST_COMMENTS, requestData);
+        return response;
       }
 
       case "get_linkedin_google_company": {
@@ -1222,30 +924,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           count_per_keyword: Number(count_per_keyword)
         };
         log(`Starting LinkedIn Google company search for keywords: ${keywords.join(', ')}`);
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_GOOGLE_COMPANY, requestData);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn Google company search error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn Google company search API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_GOOGLE_COMPANY, requestData);
+        return response;
       }
 
       case "get_linkedin_company": {
@@ -1258,30 +938,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           company
         };
         log(`Starting LinkedIn company lookup for: ${company}`);
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_COMPANY, requestData);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn company lookup error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn company API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_COMPANY, requestData);
+        return response;
       }
 
       case "get_linkedin_company_employees": {
@@ -1311,30 +969,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           requestData.last_name = last_name;
         }
         log(`Starting LinkedIn company employees lookup for companies: ${companies.join(', ')}`);
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_COMPANY_EMPLOYEES, requestData);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn company employees lookup error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn company employees API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_COMPANY_EMPLOYEES, requestData);
+        return response;
       }
 
       case "linkedin_sn_search_users": {
@@ -1421,31 +1057,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         log("Starting LinkedIn Sales Navigator users search with filters");
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_SN_SEARCH_USERS, requestData);
-          log(`Search complete, found ${response.length} results`);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn Sales Navigator search error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn Sales Navigator search API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.LINKEDIN_SN_SEARCH_USERS, requestData);
+        return response;
       }
 
       case "get_linkedin_conversations": {
@@ -1469,31 +1082,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           requestData.count = Number(count);
         }
         log("Starting LinkedIn conversations lookup");
-        try {
-          // Changed from GET to using default POST
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.CONVERSATIONS, requestData);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("LinkedIn conversations lookup error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `LinkedIn conversations API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.CONVERSATIONS, requestData);
+        return response;
       }
 
       case "google_search": {
@@ -1507,30 +1097,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           count: Math.min(Math.max(1, count), 20) // Ensure count is between 1 and 20
         };
         log(`Starting Google search for: ${query}`);
-        try {
-          const response = await makeRequest(API_CONFIG.ENDPOINTS.GOOGLE_SEARCH, requestData);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "application/json",
-                text: JSON.stringify(response, null, 2)
-              }
-            ]
-          };
-        } catch (error) {
-          log("Google search error:", error);
-          return {
-            content: [
-              {
-                type: "text",
-                mimeType: "text/plain",
-                text: `Google search API error: ${formatError(error)}`
-              }
-            ],
-            isError: true
-          };
-        }
+        const response = await makeRequest(API_CONFIG.ENDPOINTS.GOOGLE_SEARCH, requestData);
+        return response;
       }
 
       default:
@@ -1538,35 +1106,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   } catch (error) {
     log("Tool error:", error);
-    return {
-      content: [
-        {
-          type: "text",
-          mimeType: "text/plain",
-          text: `API error: ${formatError(error)}`
-        }
-      ],
-      isError: true
-    };
+    throw error;
   }
-});
-
-async function runServer() {
-  const transport = new StdioServerTransport();
-  log("Starting HDW MCP Server...");
-
-  process.on("uncaughtException", (error) => {
-    log("Uncaught Exception:", error);
-  });
-  process.on("unhandledRejection", (reason, promise) => {
-    log("Unhandled Rejection at:", promise, "reason:", reason);
-  });
-
-  await server.connect(transport);
-  log("HDW MCP Server running on stdio");
 }
-
-runServer().catch((error) => {
-  log("Fatal error running server:", error);
-  process.exit(1);
-});
